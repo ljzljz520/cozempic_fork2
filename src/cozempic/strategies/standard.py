@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 
 from ..helpers import get_content_blocks, get_msg_type, hashable_str, is_protected, msg_bytes, set_content_blocks, text_of
@@ -199,77 +200,241 @@ def strategy_tool_output_trim(messages: list[Message], config: dict) -> Strategy
     )
 
 
+_STALE_READ_TOOL_NAMES = ("Read", "read")
+_STALE_WRITE_TOOL_NAMES = ("Write", "write")
+_STALE_EDIT_TOOL_NAMES = ("Edit", "edit", "MultiEdit")
+_STALE_READ_STUB = "[stale read - file was later edited, trimmed by cozempic]"
+_STALE_MIN_CONTENT_BYTES = 500
+
+# Secondary failure signal for harnesses that return errors WITHOUT is_error.
+# Kept to SPECIFIC phrases used by file-edit tools — a successful edit result
+# ("The file has been updated") never matches. The primary signal is is_error.
+_STALE_FAILURE_RE = re.compile(
+    r"(was not found in the file|"
+    r"no replacements? (?:was|were)? ?found|"
+    r"found \d+ (?:matches?|matching sections)\b|"
+    r"did not match|"
+    r"could not(?: be)? (?:find|apply|edit|write|update|save)|"
+    r"failed to (?:apply|edit|write|update|save)|"
+    r"permission denied|"
+    r"no such file)",
+    re.IGNORECASE,
+)
+
+
+def _stale_call_scope(msg: dict) -> tuple[str, bool]:
+    """Identity scope of a tool call: project (normalized cwd) + chain kind
+    (main chain vs sidechain/subagent). Reads and writes only invalidate each
+    other INSIDE the same scope — same relative path in another project,
+    worktree, or sidechain is a different file state."""
+    cwd = msg.get("cwd") if isinstance(msg, dict) else None
+    cwd = os.path.normpath(cwd) if isinstance(cwd, str) and cwd else ""
+    sidechain = bool(msg.get("isSidechain")) if isinstance(msg, dict) else False
+    return (cwd, sidechain)
+
+
+def _stale_norm_path(path) -> str:
+    return os.path.normpath(path) if isinstance(path, str) and path else ""
+
+
+def _stale_result_text(block: dict) -> str:
+    """All text carried by a tool_result block (str content or list of text parts)."""
+    content = block.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            sub["text"] for sub in content
+            if isinstance(sub, dict) and isinstance(sub.get("text"), str)
+        )
+    return ""
+
+
+def _stale_result_failed(block: dict) -> bool:
+    """True only with positive evidence the tool call FAILED. An absent result
+    (call still in flight / delayed beyond the transcript) is NOT a failure —
+    callers treat missing results separately as outcome-unknown."""
+    if block.get("is_error"):
+        return True
+    return bool(_STALE_FAILURE_RE.search(_stale_result_text(block)))
+
+
+def _stale_content_bytes(block: dict) -> int:
+    content = block.get("content", "")
+    if isinstance(content, str):
+        return len(content.encode("utf-8", "surrogateescape"))
+    try:
+        return len(json.dumps(content, separators=(",", ":")).encode("utf-8", "surrogateescape"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _stale_stub_block(block: dict) -> dict:
+    """Replace a stale read result's body with the stub, preserving structure
+    (list content keeps non-text parts, e.g. images, untouched)."""
+    content = block.get("content", "")
+    if isinstance(content, list):
+        new_content = []
+        did_stub = False
+        for sub in content:
+            if isinstance(sub, dict) and sub.get("type") == "text" and isinstance(sub.get("text"), str):
+                if not did_stub:
+                    new_content.append({**sub, "text": _STALE_READ_STUB})
+                    did_stub = True
+                # further text parts are the same read body — collapse them
+            else:
+                new_content.append(sub)
+        if not did_stub:
+            new_content = [{"type": "text", "text": _STALE_READ_STUB}]
+        return {**block, "content": new_content}
+    return {**block, "content": _STALE_READ_STUB}
+
+
 @strategy("stale-reads", "Remove file reads superseded by later edits", "standard", "0.5-2%")
 def strategy_stale_reads(messages: list[Message], config: dict) -> StrategyResult:
-    """If a file was read and then later edited/written, the read result is stale."""
+    """Trim a file-read result only when a LATER SUCCESSFUL write demonstrably
+    covers the bytes that were read.
+
+    Invalidation rules (fail-safe: when in doubt, keep the read):
+      * identity  — read/write are correlated within (cwd, isSidechain) scope +
+                    normalized path; other projects/worktrees/sidechains are
+                    independent;
+      * success   — the write's tool_result must exist (delayed results are
+                    found by tool_use_id at ANY distance) and not be an error;
+                    failed/in-flight writes never invalidate;
+      * coverage  — Write covers the whole file; Edit/MultiEdit only invalidate
+                    when an exact `old_string` is found inside THAT read's own
+                    result text (unique match, or replace_all). A local edit in
+                    another region, or an edit whose range cannot be
+                    established, keeps the read;
+      * ordering  — the write call must come strictly AFTER the read call
+                    (parallel calls in one message never invalidate each other).
+
+    Trimming is aggregated per result message, so multiple stale reads whose
+    results share one message produce a SINGLE replace action and never
+    clobber each other (the executor keeps only one replacement per line).
+    """
     actions: list[PruneAction] = []
     total_orig = sum(b for _, _, b in messages)
     total_pruned = 0
 
-    file_events: dict[str, list[tuple[int, str, int]]] = {}
+    # tool_use_id -> (pos, line_index, result block). Built across ALL messages
+    # with no distance window: results can lag far behind their calls
+    # (background tasks / interleaved tool batches). First occurrence wins.
+    results_by_id: dict[str, tuple[int, int, dict]] = {}
 
-    for pos, (idx, msg, size) in enumerate(messages):
+    reads: list[dict] = []
+    # (scope, path) -> list of successful-or-pending write records
+    writes: dict[tuple, list[dict]] = {}
+
+    for pos, (idx, msg, _size) in enumerate(messages):
         if is_protected(msg):
             continue
+        scope = _stale_call_scope(msg)
         for block in get_content_blocks(msg):
-            if block.get("type") == "tool_use":
-                tool_name = block.get("name", "")
-                tool_input = block.get("input", {})
-                if tool_name in ("Read", "read"):
-                    fp = tool_input.get("file_path", "")
-                    if fp:
-                        file_events.setdefault(fp, []).append((pos, "read", idx))
-                elif tool_name in ("Edit", "edit", "Write", "write"):
-                    fp = tool_input.get("file_path", "")
-                    if fp:
-                        file_events.setdefault(fp, []).append((pos, "edit", idx))
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "tool_result":
+                use_id = hashable_str(block.get("tool_use_id"))
+                if use_id and use_id not in results_by_id:
+                    results_by_id[use_id] = (pos, idx, block)
+                continue
+            if btype != "tool_use":
+                continue
 
-    stale_read_positions: set[int] = set()
-    for fp, events in file_events.items():
-        events.sort(key=lambda x: x[0])
-        for i, (pos, etype, idx) in enumerate(events):
-            if etype == "read":
-                for j in range(i + 1, len(events)):
-                    if events[j][1] == "edit":
-                        stale_read_positions.add(pos)
-                        break
+            use_id = hashable_str(block.get("id"))
+            if not use_id:
+                continue
+            tool_input = block.get("input")
+            if not isinstance(tool_input, dict):
+                continue
+            name = block.get("name", "")
+            path = _stale_norm_path(tool_input.get("file_path"))
+            if not path:
+                continue
 
-    for pos, (idx, msg, size) in enumerate(messages):
-        if pos not in stale_read_positions:
+            if name in _STALE_READ_TOOL_NAMES:
+                reads.append({"pos": pos, "use_id": use_id, "scope": scope, "path": path})
+            elif name in _STALE_WRITE_TOOL_NAMES:
+                writes.setdefault((scope, path), []).append(
+                    {"pos": pos, "use_id": use_id, "full_cover": True, "old_strings": None}
+                )
+            elif name in _STALE_EDIT_TOOL_NAMES:
+                old_strings = _stale_edit_old_strings(name, tool_input)
+                writes.setdefault((scope, path), []).append({
+                    "pos": pos,
+                    "use_id": use_id,
+                    "full_cover": False,
+                    "old_strings": old_strings,
+                    "replace_all": tool_input.get("replace_all") is True,
+                })
+
+    # Decide staleness PER READ CALL (not per message — a message may carry
+    # several reads of different files with different fates).
+    stale_read_ids: set[str] = set()
+    for read in reads:
+        read_result = results_by_id.get(read["use_id"])
+        # Read failed / result missing / result unreadable: there is no valid
+        # read body whose coverage could be established — keep it.
+        if read_result is None or _stale_result_failed(read_result[2]):
             continue
-        for block in get_content_blocks(msg):
-            if block.get("type") == "tool_use" and block.get("name") in ("Read", "read"):
-                tool_use_id = block.get("id", "")
-                if not tool_use_id:
-                    continue
-                for fpos in range(pos + 1, min(pos + 5, len(messages))):
-                    fidx, fmsg, fsize = messages[fpos]
-                    for fb in get_content_blocks(fmsg):
-                        if fb.get("type") == "tool_result" and fb.get("tool_use_id") == tool_use_id:
-                            content = fb.get("content", "")
-                            if isinstance(content, str) and len(content) > 500:
-                                new_fb = {**fb, "content": "[stale read - file was later edited, trimmed by cozempic]"}
-                                new_blocks = []
-                                did_replace = False
-                                for ob in get_content_blocks(fmsg):
-                                    if ob.get("type") == "tool_result" and ob.get("tool_use_id") == tool_use_id and not did_replace:
-                                        new_blocks.append(new_fb)
-                                        did_replace = True
-                                    else:
-                                        new_blocks.append(ob)
-                                new_msg = set_content_blocks(fmsg, new_blocks)
-                                new_size = msg_bytes(new_msg)
-                                saved = fsize - new_size
-                                if saved > 0:
-                                    actions.append(PruneAction(
-                                        line_index=fidx,
-                                        action="replace",
-                                        reason="stale-read (file later edited)",
-                                        original_bytes=fsize,
-                                        pruned_bytes=new_size,
-                                        replacement=new_msg,
-                                    ))
-                                    total_pruned += saved
+        read_text = _stale_result_text(read_result[2])
+        if not read_text:
+            continue
+
+        for write in writes.get((read["scope"], read["path"]), ()):
+            if write["pos"] <= read["pos"]:
+                continue  # same message (parallel) or earlier — not a later write
+            write_result = results_by_id.get(write["use_id"])
+            if write_result is None:
+                continue  # in flight / delayed beyond transcript — outcome unknown
+            if _stale_result_failed(write_result[2]):
+                continue  # failed write never invalidates
+            if write["full_cover"]:
+                stale_read_ids.add(read["use_id"])
+                break
+            if _stale_edit_covers_read(write["old_strings"], bool(write.get("replace_all")), read_text):
+                stale_read_ids.add(read["use_id"])
+                break
+
+    # Aggregate stubs per RESULT message: one PruneAction per carrier line.
+    plan: dict[int, set[str]] = {}
+    for use_id in stale_read_ids:
+        rpos, ridx, rblock = results_by_id[use_id]
+        if is_protected(messages[rpos][1]):
+            continue
+        if _stale_content_bytes(rblock) <= _STALE_MIN_CONTENT_BYTES:
+            continue
+        plan.setdefault(ridx, set()).add(use_id)
+
+    idx_to_pos = {idx: pos for pos, (idx, _m, _s) in enumerate(messages)}
+    for fidx, ids in plan.items():
+        fpos = idx_to_pos.get(fidx)
+        if fpos is None:
+            continue
+        _fidx, fmsg, fsize = messages[fpos]
+        new_blocks = []
+        for block in get_content_blocks(fmsg):
+            if (isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                    and hashable_str(block.get("tool_use_id")) in ids):
+                new_blocks.append(_stale_stub_block(block))
+            else:
+                new_blocks.append(block)
+        new_msg = set_content_blocks(fmsg, new_blocks)
+        new_size = msg_bytes(new_msg)
+        saved = fsize - new_size
+        if saved > 0:
+            actions.append(PruneAction(
+                line_index=fidx,
+                action="replace",
+                reason="stale-read (file later edited)",
+                original_bytes=fsize,
+                pruned_bytes=new_size,
+                replacement=new_msg,
+            ))
+            total_pruned += saved
 
     replaced = len(actions)
     return StrategyResult(
@@ -282,6 +447,52 @@ def strategy_stale_reads(messages: list[Message], config: dict) -> StrategyResul
         messages_replaced=replaced,
         summary=f"Trimmed {replaced} stale file read results",
     )
+
+
+def _stale_edit_old_strings(name: str, tool_input: dict) -> list[str] | None:
+    """Extract the exact strings an edit replaced, in file coordinates.
+
+    Returns None when the covered range cannot be established (malformed
+    input / empty needles) — such an edit can NEVER prove coverage, so reads
+    are kept. MultiEdit yields one needle per sub-edit."""
+    if name == "MultiEdit":
+        edits = tool_input.get("edits")
+        if not isinstance(edits, list) or not edits:
+            return None
+        needles: list[str] = []
+        for sub in edits:
+            if not isinstance(sub, dict):
+                return None
+            old = sub.get("old_string")
+            if not isinstance(old, str) or not old:
+                return None
+            needles.append(old)
+        return needles or None
+    old = tool_input.get("old_string")
+    if not isinstance(old, str) or not old:
+        return None
+    return [old]
+
+
+def _stale_edit_covers_read(old_strings: list[str] | None, replace_all: bool,
+                            read_text: str) -> bool:
+    """True only if a successful edit demonstrably changed bytes INSIDE the
+    read's own result text:
+
+      * an `old_string` absent from the read body edited a different region
+        (local/partial edit) — no coverage;
+      * exactly one occurrence in the read body — certain coverage (a
+        non-replace_all Edit that SUCCEEDED was globally unique);
+      * multiple occurrences only count with replace_all (every occurrence,
+        including the read one, was replaced); ambiguity otherwise -> keep.
+    """
+    if not old_strings:
+        return False  # range unknown
+    for old in old_strings:
+        hits = read_text.count(old)
+        if hits == 1 or (hits > 1 and replace_all):
+            return True
+    return False
 
 
 @strategy("system-reminder-dedup", "Deduplicate repeated <system-reminder> tags", "standard", "0.1-3%")
